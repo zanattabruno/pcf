@@ -613,6 +613,8 @@ func (p *Processor) HandleUpdateSmPolicyContextRequest(
 	smPolicyId string,
 	request models.SmPolicyUpdateContextData,
 ) {
+	qosLabCreateMu.Lock()
+	defer qosLabCreateMu.Unlock()
 	logger.SmPolicyLog.Infof("Handle UpdateSmPolicyContext")
 
 	logger.SmPolicyLog.Traceln("Handle updateSmPolicyContext")
@@ -969,6 +971,20 @@ func (p *Processor) HandleUpdateSmPolicyContextRequest(
 			failRules = append(failRules, rule)
 			// release fail pccRules in SmPolicy
 			for _, pccRuleID := range rule.PccRuleIds {
+				labOwned := false
+				for sid := range smPolicy.AppSessions {
+					if v, ok := p.Context().AppSessionPool.Load(sid); ok {
+						a := v.(*pcf_context.AppSessionData)
+						if strings.HasPrefix(a.AppSessionContext.AscReqData.AfAppId, "qoslab-") {
+							if _, ok := a.PccRuleIdMapToCompId[pccRuleID]; ok {
+								labOwned = true
+							}
+						}
+					}
+				}
+				if labOwned {
+					continue
+				}
 				if err := smPolicy.RemovePccRule(pccRuleID, nil); err != nil {
 					logger.SmPolicyLog.Warnf(
 						"SM Policy Notification about failed installing PccRule[%s]", err.Error())
@@ -984,7 +1000,7 @@ func (p *Processor) HandleUpdateSmPolicyContextRequest(
 	}
 	if afEventsNotification.EvNotifs != nil {
 		p.sendSmPolicyRelatedAppSessionNotification(
-			smPolicy, afEventsNotification, request.AccuUsageReports, successRules, failRules)
+			smPolicy, afEventsNotification, request.AccuUsageReports, successRules, failRules, request.QncReports)
 	}
 
 	if errCause != "" {
@@ -1011,7 +1027,7 @@ func (p *Processor) HandleUpdateSmPolicyContextRequest(
 
 func (p *Processor) sendSmPolicyRelatedAppSessionNotification(smPolicy *pcf_context.UeSmPolicyData,
 	notification models.PcfPolicyAuthorizationEventsNotification, usageReports []models.AccuUsageReport,
-	successRules, failRules []models.RuleReport,
+	successRules, failRules []models.RuleReport, qncReports []models.PcfSmPolicyControlQosNotificationControlInfo,
 ) {
 	for appSessionId := range smPolicy.AppSessions {
 		if val, exist := p.Context().AppSessionPool.Load(appSessionId); exist {
@@ -1068,8 +1084,10 @@ func (p *Processor) sendSmPolicyRelatedAppSessionNotification(smPolicy *pcf_cont
 										}
 									}
 									// Release related resource
-									delete(appSession.PccRuleIdMapToCompId, pccRuleId)
-									delete(appSession.RelatedPccRuleIds, key)
+									if !strings.HasPrefix(appSession.AppSessionContext.AscReqData.AfAppId, "qoslab-") {
+										delete(appSession.PccRuleIdMapToCompId, pccRuleId)
+										delete(appSession.RelatedPccRuleIds, key)
+									}
 								}
 							}
 						}
@@ -1084,21 +1102,27 @@ func (p *Processor) sendSmPolicyRelatedAppSessionNotification(smPolicy *pcf_cont
 					case models.PcfPolicyAuthorizationAfEvent_PLMN_CHG:
 						sessionNotif.PlmnId = notification.PlmnId
 					case models.PcfPolicyAuthorizationAfEvent_QOS_NOTIF:
-						// TODO: Send Qos Notification to AF
-						// SMF notify PCF : 29.512 4.2.4.20 Notification about Service Data Flow QoS target enforcement
-						// PCF notify AF : 29.514  4.2.5.4 Notification about Service Data Flow QoS notification control
-
-						// for _, report := range sessionNotif.QncReports {
-						// 	for _, pccRuleId := range report.RefPccRuleIds {
-						// 		if _, exist := appSession.PccRuleIdMapToCompId[pccRuleId]; exist {
-						// 			sessionNotif.QncReports = append(sessionNotif.QncReports, report)
-						// 			break
-						// 		}
-						// 	}
-						// }
-						// if sessionNotif.QncReports == nil {
-						// 	continue
-						// }
+						for _, report := range qncReports {
+							item := models.PcfPolicyAuthorizationQosNotificationControlInfo{NotifType: report.NotifType}
+							for _, ruleID := range report.RefPccRuleIds {
+								if key, ok := appSession.PccRuleIdMapToCompId[ruleID]; ok {
+									parts := strings.Split(key, "-")
+									comp, _ := strconv.Atoi(parts[0])
+									flow := models.Flows{MedCompN: int32(comp)}
+									if len(parts) == 2 {
+										n, _ := strconv.Atoi(parts[1])
+										flow.FNums = []int32{int32(n)}
+									}
+									item.Flows = append(item.Flows, flow)
+								}
+							}
+							if len(item.Flows) > 0 {
+								sessionNotif.QncReports = append(sessionNotif.QncReports, item)
+							}
+						}
+						if len(sessionNotif.QncReports) == 0 {
+							continue
+						}
 					case models.PcfPolicyAuthorizationAfEvent_SUCCESSFUL_RESOURCES_ALLOCATION:
 						// Subscription to resources allocation outcome
 						if successRules == nil {
@@ -1177,6 +1201,7 @@ func (p *Processor) sendSmPolicyRelatedAppSessionNotification(smPolicy *pcf_cont
 				}
 			}
 			if sessionNotif.EvNotifs != nil {
+				appSession.AppSessionContext.EvsNotif = &sessionNotif
 				p.SendAppSessionEventNotification(appSession, sessionNotif)
 			}
 		}
@@ -1185,15 +1210,15 @@ func (p *Processor) sendSmPolicyRelatedAppSessionNotification(smPolicy *pcf_cont
 
 func (p *Processor) SendSMPolicyUpdateNotification(
 	uri string, request *models.SmPolicyNotification,
-) {
+) error {
 	if uri == "" {
 		logger.SmPolicyLog.Warnln("SM Policy Update Notification Error[uri is empty]")
-		return
+		return fmt.Errorf("SM policy notification unavailable")
 	}
 
 	ctx, _, err := p.Context().GetTokenCtx(models.ServiceName_NPCF_SMPOLICYCONTROL, models.NrfNfManagementNfType_PCF)
 	if err != nil {
-		return
+		return fmt.Errorf("SM policy notification unavailable")
 	}
 
 	client := util.GetNpcfSMPolicyCallbackClient()
@@ -1213,6 +1238,7 @@ func (p *Processor) SendSMPolicyUpdateNotification(
 	default:
 		logger.SmPolicyLog.Warnf("SM Policy Update Notification Unknown Error %+v", err)
 	}
+	return err
 }
 
 func (p *Processor) SendSMPolicyTerminationRequestNotification(

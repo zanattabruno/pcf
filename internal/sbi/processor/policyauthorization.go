@@ -1,9 +1,12 @@
 package processor
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cydev/zero"
@@ -17,6 +20,8 @@ import (
 	"github.com/free5gc/pcf/internal/util"
 	"github.com/free5gc/util/metrics/sbi"
 )
+
+var qosLabCreateMu sync.Mutex
 
 const (
 	Precedence_Initial      int32 = 22
@@ -162,6 +167,32 @@ func (p *Processor) postAppSessCtxProcedure(appSessCtx *models.AppSessionContext
 	string, *models.ProblemDetails,
 ) {
 	ascReqData := appSessCtx.AscReqData
+	if ascReqData == nil {
+		pd := util.GetProblemDetail("ascReqData required", util.ERROR_REQUEST_PARAMETERS)
+		return nil, "", &pd
+	}
+	// Stable identities make a NEF retry after a lost response safe.
+	if strings.HasPrefix(ascReqData.AfAppId, "qoslab-") {
+		qosLabCreateMu.Lock()
+		defer qosLabCreateMu.Unlock()
+		var existing *pcf_context.AppSessionData
+		p.Context().AppSessionPool.Range(func(_, v interface{}) bool {
+			a := v.(*pcf_context.AppSessionData)
+			if a.AppSessionContext.AscReqData.AfAppId == ascReqData.AfAppId {
+				existing = a
+				return false
+			}
+			return true
+		})
+		if existing != nil {
+			old := existing.AppSessionContext.AscReqData
+			if old.UeIpv4 != ascReqData.UeIpv4 || !reflect.DeepEqual(old.MedComponents, ascReqData.MedComponents) {
+				pd := util.GetProblemDetail("AF request identity reused", util.ERROR_REQUEST_PARAMETERS)
+				return nil, "", &pd
+			}
+			return existing.AppSessionContext, util.GetResourceUri(models.ServiceName_NPCF_POLICYAUTHORIZATION, existing.AppSessionId), nil
+		}
+	}
 	pcfSelf := p.Context()
 
 	// Initial BDT policy indication(the only one which is not related to session)
@@ -439,6 +470,10 @@ func (p *Processor) postAppSessCtxProcedure(appSessCtx *models.AppSessionContext
 			ResourceUri:      util.GetResourceUri(models.ServiceName_NPCF_SMPOLICYCONTROL, smPolicyID),
 			SmPolicyDecision: smPolicy.PolicyDecision,
 		}
+		if strings.HasPrefix(ascReqData.AfAppId, "qoslab-") {
+			notification.SmPolicyDecision = labPolicyDelta(smPolicy.PolicyDecision, relatedPccRuleIds)
+		}
+
 		go p.SendSMPolicyUpdateNotification(smPolicy.PolicyContext.NotificationUri, &notification)
 	}
 	return appSessCtx, locationHeader, nil
@@ -476,6 +511,21 @@ func (p *Processor) HandleDeleteAppSessionContext(
 		return
 	}
 
+	labOwned := strings.HasPrefix(appSession.AppSessionContext.AscReqData.AfAppId, "qoslab-")
+	if labOwned {
+		qosLabCreateMu.Lock()
+		defer qosLabCreateMu.Unlock()
+		removal := &models.SmPolicyDecision{PccRules: map[string]*models.PccRule{}}
+		for _, id := range appSession.RelatedPccRuleIds {
+			removal.PccRules[id] = nil
+		}
+		notification := &models.SmPolicyNotification{ResourceUri: util.GetResourceUri(models.ServiceName_NPCF_SMPOLICYCONTROL, fmt.Sprintf("%s-%d", smPolicy.PcfUe.Supi, smPolicy.PolicyContext.PduSessionId)), SmPolicyDecision: removal}
+		if err := p.SendSMPolicyUpdateNotification(smPolicy.PolicyContext.NotificationUri, notification); err != nil {
+			c.JSON(503, models.ProblemDetails{Status: 503, Detail: "SMF resource cleanup has not completed: " + err.Error()})
+			return
+		}
+	}
+
 	// Remove related pcc rule resource
 	deletedSmPolicyDec := models.SmPolicyDecision{}
 	for _, pccRuleID := range appSession.RelatedPccRuleIds {
@@ -510,7 +560,9 @@ func (p *Processor) HandleDeleteAppSessionContext(
 		ResourceUri:      util.GetResourceUri(models.ServiceName_NPCF_SMPOLICYCONTROL, smPolicyID),
 		SmPolicyDecision: &deletedSmPolicyDec,
 	}
-	go p.SendSMPolicyUpdateNotification(smPolicy.PolicyContext.NotificationUri, &notification)
+	if !labOwned {
+		go p.SendSMPolicyUpdateNotification(smPolicy.PolicyContext.NotificationUri, &notification)
+	}
 	logger.PolicyAuthLog.Tracef("Send SM Policy[%s] Update Notification", smPolicyID)
 	c.Status(http.StatusNoContent)
 }
@@ -520,6 +572,8 @@ func (p *Processor) HandleGetAppSessionContext(
 	c *gin.Context,
 	appSessionId string,
 ) {
+	qosLabCreateMu.Lock()
+	defer qosLabCreateMu.Unlock()
 	logger.PolicyAuthLog.Infof("Handle Get AppSessions, AppSessionId[%s]", appSessionId)
 
 	pcfSelf := p.Context()
@@ -544,6 +598,8 @@ func (p *Processor) HandleModAppSessionContext(
 	appSessionId string,
 	appSessionContextUpdateData models.AppSessionContextUpdateData,
 ) {
+	qosLabCreateMu.Lock()
+	defer qosLabCreateMu.Unlock()
 	logger.PolicyAuthLog.Infof("Handle Modify AppSessions, AppSessionId[%s]", appSessionId)
 
 	pcfSelf := p.Context()
@@ -855,6 +911,8 @@ func (p *Processor) HandleDeleteEventsSubscContext(
 	c *gin.Context,
 	appSessionId string,
 ) {
+	qosLabCreateMu.Lock()
+	defer qosLabCreateMu.Unlock()
 	logger.PolicyAuthLog.Tracef("Handle Del AppSessions Events Subsc, AppSessionId[%s]", appSessionId)
 
 	pcfSelf := p.Context()
@@ -903,6 +961,8 @@ func (p *Processor) HandleUpdateEventsSubscContext(
 	appSessionId string,
 	eventsSubscReqData models.PcfPolicyAuthorizationEventsSubscReqData,
 ) {
+	qosLabCreateMu.Lock()
+	defer qosLabCreateMu.Unlock()
 	logger.PolicyAuthLog.Tracef("Handle Put AppSessions Events Subsc, AppSessionId[%s]", appSessionId)
 
 	pcfSelf := p.Context()
@@ -1834,4 +1894,25 @@ func reverseStringMap(srcMap map[string]string) map[string]string {
 		reverseMap[value] = key
 	}
 	return reverseMap
+}
+
+// Only this AF's PCC rules participate in allocation/failure reports. Sending
+// the entire PDU policy would fail already active flows when a new one is denied.
+func labPolicyDelta(decision *models.SmPolicyDecision, related map[string]string) *models.SmPolicyDecision {
+	b, _ := json.Marshal(decision)
+	var d models.SmPolicyDecision
+	_ = json.Unmarshal(b, &d)
+	rules := map[string]*models.PccRule{}
+	qos := map[string]*models.QosData{}
+	for _, id := range related {
+		if r := d.PccRules[id]; r != nil {
+			rules[id] = r
+			for _, qid := range r.RefQosData {
+				qos[qid] = d.QosDecs[qid]
+			}
+		}
+	}
+	d.PccRules = rules
+	d.QosDecs = qos
+	return &d
 }
