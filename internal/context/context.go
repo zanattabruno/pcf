@@ -283,8 +283,9 @@ func (c *PCFContext) PCFUeFindByAppSessionId(appSessionId string) *UeContext {
 func (c *PCFContext) PcfUeFindByIPv4(v4 string) *UeContext {
 	var ue *UeContext
 	c.UePool.Range(func(key, value interface{}) bool {
-		ue = value.(*UeContext)
-		if ue.SMPolicyFindByIpv4(v4) != nil {
+		candidate := value.(*UeContext)
+		if candidate.SMPolicyFindByIpv4(v4) != nil {
+			ue = candidate
 			return false
 		} else {
 			return true
@@ -298,8 +299,9 @@ func (c *PCFContext) PcfUeFindByIPv4(v4 string) *UeContext {
 func (c *PCFContext) PcfUeFindByIPv6(v6 string) *UeContext {
 	var ue *UeContext
 	c.UePool.Range(func(key, value interface{}) bool {
-		ue = value.(*UeContext)
-		if ue.SMPolicyFindByIpv6(v6) != nil {
+		candidate := value.(*UeContext)
+		if candidate.SMPolicyFindByIpv6(v6) != nil {
+			ue = candidate
 			return false
 		} else {
 			return true
@@ -361,7 +363,7 @@ func (c *PCFContext) SessionBinding(req *models.AppSessionContextReqData) (*UeSm
 		c.UePool.Range(func(key, value interface{}) bool {
 			ue := value.(*UeContext)
 			policy, err = ueSMPolicyFindByAppSessionContext(ue, req)
-			return true
+			return policy == nil
 		})
 	}
 	if policy == nil && err == nil {
